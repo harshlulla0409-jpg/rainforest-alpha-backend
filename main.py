@@ -3,11 +3,10 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
+from pydantic import BaseModel, Field
+from typing import List, Dict
 import pandas as pd
 import numpy as np
-from pydantic import BaseModel
 from sklearn.linear_model import LinearRegression
 
 app = FastAPI()
@@ -15,9 +14,9 @@ app = FastAPI()
 # ── 1. MIDDLEWARE SETUP ──
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permits any frontend port or host signature
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows standard GET, POST, and OPTIONS pre-flights
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -25,7 +24,6 @@ app.add_middleware(
 DB_PATH = "./data/your_alpha_data.csv"
 try:
     df_full = pd.read_csv(DB_PATH)
-    # Split dataset 75/25 for In-Sample (is) vs Out-of-Sample (oos) environments
     train_idx = int(len(df_full) * 0.75)
     datasets = {
         "is": df_full.iloc[:train_idx].copy(),
@@ -43,39 +41,87 @@ class UpstreamFilter(BaseModel):
     selectedBuckets: List[int]
 
 class BucketRequest(BaseModel):
-    dataset: str             # "is" or "oos"
-    alphaId: str             # Active metric being bucketed
-    thresholds: List[float]  # Custom boundary thresholds set by user sliders
-    upstreamFilters: List[UpstreamFilter]  # Parent panel segmentations
-class RegressionRequest(BaseModel):
-    dataset: str         # "is" or "oos"
-    features: List[str]  # e.g., ["obi_pressure", "trade_flow_imb"]
-    target: str          # "r60", "r300", or "r1800"
+    dataset: str
+    alphaId: str
+    thresholds: List[float]
+    upstreamFilters: List[UpstreamFilter]
 
-# ── 4. LIVE API ENDPOINTS (MUST BE DECLARED FIRST) ──
+# Updated to mirror your frontend state schemas
+class RegressionRequest(BaseModel):
+    dataset: str
+    features: List[str]
+    target: str
+    name: str = Field(default="custom_alpha")  # Maps directly to regressionName frontend state
+
+# ── 4. LIVE API ENDPOINTS ──
 
 @app.get("/api/data/meta")
 def get_meta():
-    """Returns absolute row counts to initial workspace view indicators."""
     return {
         "isRows": len(datasets["is"]),
         "oosRows": len(datasets["oos"])
     }
 
+@app.post("/api/regression")
+def run_alpha_regression(req: RegressionRequest):
+    """
+    Runs OLS Regression and stamps the resulting combined array predictions 
+    onto a brand new, uniquely named alpha column on the server.
+    """
+    df_is = datasets.get("is")
+    if df_is is None or df_is.empty or not req.features:
+        return {"error": "Invalid training conditions or empty feature selection matrix provided."}
+        
+    try:
+        # Sanitize and validate chosen input dimensions
+        valid_features = [f for f in req.features if f in df_is.columns]
+        if not valid_features:
+            return {"error": "None of the selected alpha tracking features were found in the database."}
+
+        # Train model using In-Sample configuration matrices
+        X_train = df_is[valid_features].fillna(0)
+        y_train = df_is[req.target].fillna(0)
+        
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        r_squared = float(model.score(X_train, y_train))
+        
+        # Ensure the name is clean and won't break dictionary lookups
+        sanitized_name = "".join([c for c in req.name if c.isalnum() or c == "_"])
+        if not sanitized_name:
+            sanitized_name = "custom_alpha"
+
+        # Calculate and store the predictions in the dynamic custom column name
+        for split_key in ["is", "oos"]:
+            target_df = datasets[split_key]
+            if not target_df.empty:
+                X_slice = target_df[valid_features].fillna(0)
+                # This directly implements 'row[name] = val' across the pandas dataframe block
+                datasets[split_key][sanitized_name] = model.predict(X_slice)
+
+        feature_weights = {feat: float(w) for feat, w in zip(valid_features, model.coef_)}
+
+        return {
+            "status": "success",
+            "rSquared": r_squared,
+            "intercept": float(model.intercept_),
+            "coefficients": feature_weights,
+            "signalName": sanitized_name,
+            "message": f"Custom alpha metric '{sanitized_name}' successfully built and cached in memory pools."
+        }
+        
+    except Exception as e:
+        return {"error": f"Mathematical engine calculation exception occurred: {str(e)}"}
+
 @app.post("/api/buckets")
 def calculate_buckets(req: BucketRequest):
-    """
-    Executes deep statistical data-bucketing entirely on the server.
-    Applies sequential cascade filtering across parent nodes before dividing cuts.
-    """
-    # Fetch target split
     df = datasets.get(req.dataset, pd.DataFrame()).copy()
     total_rows = len(df)
     
     if df.empty:
         return {"buckets": [], "filteredRows": 0, "totalRows": 0}
 
-    # Apply parent/upstream filters sequentially using digital array indices
+    # Apply parent / cascade metric filtering panels
     for f in req.upstreamFilters:
         if f.alphaId in df.columns and len(f.thresholds) > 0:
             sorted_thresh = sorted(f.thresholds)
@@ -83,14 +129,21 @@ def calculate_buckets(req: BucketRequest):
             df = df[np.isin(b_indices, f.selectedBuckets)]
 
     filtered_rows = len(df)
+    
+    # Check if target column exists (including newly dynamically generated regression variables)
+    if req.alphaId not in df.columns:
+        return {
+            "error": f"Alpha ID '{req.alphaId}' not found. Ensure you ran the regression model first.",
+            "buckets": [], "filteredRows": 0, "totalRows": total_rows
+        }
+
     if filtered_rows == 0:
         return {"buckets": [], "filteredRows": 0, "totalRows": total_rows}
 
-    # Bucket active alpha dimension using current workspace edge cut arrays
+    # Slice out active dataset using current threshold slider configuration boundaries
     sorted_cuts = sorted(req.thresholds)
     df['bucket_idx'] = np.searchsorted(sorted_cuts, df[req.alphaId])
     
-      # Process return averages bucket by bucket inside memory matrix paths
     bucket_stats = []
     num_expected_buckets = len(sorted_cuts) + 1
     
@@ -98,7 +151,6 @@ def calculate_buckets(req: BucketRequest):
         b_df = df[df['bucket_idx'] == b_id]
         count = len(b_df)
         
-        # Build bound string tags dynamically
         if b_id == 0:
             lbl = f"[-inf, {sorted_cuts[0]:.2f}]" if sorted_cuts else "All"
         elif b_id == len(sorted_cuts):
@@ -106,12 +158,12 @@ def calculate_buckets(req: BucketRequest):
         else:
             lbl = f"[{sorted_cuts[b_id-1]:.2f}, {sorted_cuts[b_id]:.2f}]"
 
-        # ── EXACT FRONTEND KEY PAIRS CONFIGURATION ──
+        # Explicit key variables mapping safely to frontend HFTGame.tsx line 396 expectations
         bucket_stats.append({
             "bucketIndex": b_id,
             "label": lbl,
-            "n": count,  # Maps directly to b.n
-            "r60": float(b_df['r60'].mean()) if count > 0 and not np.isnan(b_df['r60'].mean()) else 0.0,  # Maps to b.r60
+            "n": count,
+            "r60": float(b_df['r60'].mean()) if count > 0 and not np.isnan(b_df['r60'].mean()) else 0.0,
             "r300": float(b_df['r300'].mean()) if count > 0 and not np.isnan(b_df['r300'].mean()) else 0.0,
             "r1800": float(b_df['r1800'].mean()) if count > 0 and not np.isnan(b_df['r1800'].mean()) else 0.0,
         })
@@ -122,62 +174,6 @@ def calculate_buckets(req: BucketRequest):
         "totalRows": total_rows
     }
 
-@app.post("/api/regression")
-def run_alpha_regression(req: RegressionRequest):
-    """
-    Runs an Ordinary Least Squares (OLS) Linear Regression natively on the server.
-    Saves a dynamic combined tracking metric column inside memory data matrices.
-    """
-    # Grab the current split environment arrays
-    df_is = datasets.get("is")
-    df_oos = datasets.get("oos")
-    
-    if df_is is None or df_is.empty or not req.features:
-        return {"error": "Invalid training conditions or empty feature selection matrix provided."}
-        
-    try:
-        # Validate that selected feature string tokens exist in database schemas
-        valid_features = [f for f in req.features if f in df_is.columns]
-        if not valid_features:
-            return {"error": "None of the selected alpha tracking features were found in the database."}
-
-        # 1. Extract feature data slices and targets from the In-Sample training slice
-        X_train = df_is[valid_features].fillna(0)
-        y_train = df_is[req.target].fillna(0)
-        
-        # 2. Train the linear regression model
-        model = LinearRegression()
-        model.fit(X_train, y_train)
-        
-        # 3. Calculate model fit score (R-squared)
-        r_squared = float(model.score(X_train, y_train))
-        
-        # 4. Generate the optimized combined trading signal for both data splits
-        # This creates the new temporary column dynamically inside server memory
-        for split_key in ["is", "oos"]:
-            target_df = datasets[split_key]
-            if not target_df.empty:
-                X_slice = target_df[valid_features].fillna(0)
-                # Compute dot-product weights and overwrite custom tracking label fields
-                datasets[split_key]["custom_regression_signal"] = model.predict(X_slice)
-
-        # 5. Format coefficients into a clean dictionary map for the front-end display
-        feature_weights = {}
-        for feature_name, coeff_val in zip(valid_features, model.coef_):
-            feature_weights[feature_name] = float(coeff_val)
-
-        return {
-            "status": "success",
-            "rSquared": r_squared,
-            "intercept": float(model.intercept_),
-            "coefficients": feature_weights,
-            "message": "Custom tracking signal 'custom_regression_signal' calculated across data matrix maps."
-        }
-        
-    except Exception as e:
-        return {"error": f"Mathematical engine calculation exception occurred: {str(e)}"}
-
- 
 # ── 5. STATIC WORKSPACE CLIENT ROUTING (MUST BE LAST) ──
 if os.path.exists("./dist"):
     print("Static build directory located. Mounting frontend web assets...")
@@ -185,7 +181,7 @@ if os.path.exists("./dist"):
 
     @app.get("/{catchall:path}")
     def serve_frontend(catchall: str):
-        """Serves UI core shell code for any browser paths routing over standard Port 80."""
         return FileResponse("./dist/index.html")
 else:
     print("Notice: './dist' folder not found. Server running in API-only mode.")
+
