@@ -1,11 +1,14 @@
 import os
+import json
 import requests
+import psycopg2
+from psycopg2.extras import Json
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Dict
+from typing import List, Dict, Any
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
@@ -28,7 +31,6 @@ try:
     df_raw = pd.read_csv(DB_PATH)
     if '""' in df_raw.columns:
         df_raw = df_raw.drop(columns=['""'])
-    
     # Sort data linearly by historical time rows if present
     if "Date" in df_raw.columns and "time" in df_raw.columns:
         df_raw = df_raw.sort_values(by=["Date", "time"]).reset_index(drop=True)
@@ -44,7 +46,14 @@ except Exception as e:
     print(f"Database Error: Failed to ingest production csv mapping ({e}). Running on empty fallbacks.")
     datasets = {"is": pd.DataFrame(), "oos": pd.DataFrame()}
 
-# ── 3. DATA PROTOCOL SCHEMAS ──
+# ── 3. ENV DATABASE CONNECTION HELPER ──
+DATABASE_URL = os.getenv("DATABASE_URL")
+def get_db_connection():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL)
+
+# ── 4. DATA PROTOCOL SCHEMAS ──
 class AuthRequest(BaseModel):
     code: str
 
@@ -55,18 +64,18 @@ class UpstreamFilter(BaseModel):
 
 class BucketRequest(BaseModel):
     dataset: str
-    side: int                # Accepts: 1 (Buys), -1 (Sells), or 0 (All Sides)
+    side: int # Accepts: 1 (Buys), -1 (Sells), or 0 (All Sides)
     alphaId: str
     thresholds: List[float]
     upstreamFilters: List[UpstreamFilter]
 
 class RegressionRequest(BaseModel):
-    dataset: str
+    userId: str                       # Appended automatically by authenticated frontend
     features: List[str]
-    target: str                  # Can accept any column key: r5, r10, r60, r1800, etc.
+    target: str                       # Can accept any column key: r5, r10, r60, r1800, etc.
     name: str = Field(default="custom_alpha")
 
-# ── 4. PRODUCTION ENDPOINT ROUTING MANAGEMENT ──
+# ── 5. PRODUCTION ENDPOINT ROUTING MANAGEMENT ──
 
 @app.post("/api/auth/github")
 def github_authentication_handshake(req: AuthRequest):
@@ -74,10 +83,8 @@ def github_authentication_handshake(req: AuthRequest):
     Exchanges GitHub OAuth codes for access token hashes.
     Stores and returns unique user identifier credentials.
     """
-    # Grab your secure OAuth keys from your Railway environment configuration variables panel
     client_id = os.getenv("GITHUB_CLIENT_ID")
     client_secret = os.getenv("GITHUB_CLIENT_SECRET")
-    
     try:
         # Step A: Exchange the code for a GitHub Access Token
         token_res = requests.post(
@@ -85,21 +92,19 @@ def github_authentication_handshake(req: AuthRequest):
             headers={"Accept": "application/json"},
             data={"client_id": client_id, "client_secret": client_secret, "code": req.code}
         ).json()
-        
         access_token = token_res.get("access_token")
         if not access_token:
             return {"status": "error", "message": "Failed to exchange security authorization code token."}
-            
+
         # Step B: Fetch the user's public profile data using the access token
         user_profile = requests.get(
             "https://api.github.com/user",
             headers={"Authorization": f"token {access_token}"}
         ).json()
-        
         github_id = str(user_profile.get("id"))
         username = user_profile.get("login")
         avatar_url = user_profile.get("avatar_url")
-        
+
         # Step C: Save or update the user inside your Supabase database instance
         try:
             conn = get_db_connection()
@@ -117,9 +122,9 @@ def github_authentication_handshake(req: AuthRequest):
                     )
                     conn.commit()
                     conn.close()
-        except NameError:
-            print("WARNING: get_db_connection() is undefined. User not saved to DB.")
-                
+        except Exception as db_err:
+            print(f"WARNING: Database issue during auth tracking: {db_err}")
+
         return {
             "status": "success",
             "user": {
@@ -142,11 +147,13 @@ def get_meta():
 @app.post("/api/regression")
 def run_alpha_regression(req: RegressionRequest):
     """
-    Fits an OLS Linear Regression on selected microstructural data features.
-    Stamps model prediction outputs onto a unique custom signal name parameter.
+    Fits an OLS Linear Regression on In-Sample (IS) data, computes metrics on 
+    Out-of-Sample (OOS) data, and saves to the database if OOS R2 > 20% and coverage > 1%.
     """
     df_is = datasets.get("is")
-    if df_is is None or df_is.empty or not req.features:
+    df_oos = datasets.get("oos")
+    
+    if df_is is None or df_is.empty or df_oos is None or df_oos.empty or not req.features:
         return {"error": "Insufficient data arrays or empty feature selection parameters provided."}
         
     try:
@@ -154,41 +161,102 @@ def run_alpha_regression(req: RegressionRequest):
         valid_features = [f for f in req.features if f in df_is.columns]
         if not valid_features:
             return {"error": "None of the chosen tracking alphas were discovered inside the database."}
-
         if req.target not in df_is.columns:
             return {"error": f"Target horizon matrix '{req.target}' is missing from the dataset schemas."}
 
-        # Handle numeric casts safely
+        # Step A: Extract matrices and train OLS model strictly on In-Sample (IS) data
         X_train = df_is[valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
-        y_train = pd.to_numeric(df_is[req.target], errors='coerce').fillna(0) * 100
+        y_train = pd.to_numeric(df_is[req.target], errors='coerce').fillna(0)
         
-        # Fit SciKit-Learn Regression Engine
         model = LinearRegression()
         model.fit(X_train, y_train)
-        r_squared = float(model.score(X_train, y_train))
-        
+        is_r2 = float(model.score(X_train, y_train)) * 100
+
+        # Step B: Generate signal predictions and compute score on Out-of-Sample (OOS) data
+        X_test = df_oos[valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
+        y_test = pd.to_numeric(df_oos[req.target], errors='coerce').fillna(0)
+        oos_r2 = float(model.score(X_test, y_test)) * 100
+
         # Sanitize target signature token label
         sanitized_name = "".join([c for c in req.name if c.isalnum() or c == "_"])
         if not sanitized_name:
             sanitized_name = "custom_alpha"
 
-        # Apply computed beta weights matrix to save the new dynamic tracking row
+        # Apply computed beta weights matrix to save the new dynamic tracking row in memory
         for split_key in ["is", "oos"]:
             if not datasets[split_key].empty:
                 X_slice = datasets[split_key][valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
                 datasets[split_key][sanitized_name] = model.predict(X_slice)
 
+        # Step C: Evaluate Out-of-Sample (OOS) data bucket distribution density (10 quantiles)
+        df_oos_eval = datasets["oos"].copy()
+        df_oos_eval['bucket_idx'] = pd.qcut(df_oos_eval[sanitized_name], q=10, labels=False, duplicates='drop')
+        
+        oos_total_rows = len(df_oos_eval)
+        oos_bucket_stats = []
+        has_sufficient_coverage = True
+
+        for b_id in sorted(df_oos_eval['bucket_idx'].unique()):
+            b_df = df_oos_eval[df_oos_eval['bucket_idx'] == b_id]
+            count = len(b_df)
+            coverage_pct = (count / oos_total_rows) * 100
+            
+            # CRITERIA CHECK: Verify each individual bucket contains > 1% data coverage
+            if coverage_pct <= 1.0:
+                has_sufficient_coverage = False
+
+            oos_bucket_stats.append({
+                "bucketIndex": int(b_id),
+                "count": count,
+                "coveragePct": round(coverage_pct, 2),
+                "r60_bps": float(b_df['r60'].mean() * 100) if not np.isnan(b_df['r60'].mean()) else 0.0,
+                "r300_bps": float(b_df['r300'].mean() * 100) if not np.isnan(b_df['r300'].mean()) else 0.0,
+                "r1800_bps": float(b_df['r1800'].mean() * 100) if not np.isnan(b_df['r1800'].mean()) else 0.0,
+            })
+
+        # Step D: CRITERIA CHECK - Trigger cloud archive if OOS R2 > 20% and bucket coverage > 1%
+        saved_to_db = False
+        db_error = None
         feature_weights = {feat: float(w) for feat, w in zip(valid_features, model.coef_)}
+        
+        if oos_r2 > 20.0 and has_sufficient_coverage:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO alpha_strategies 
+                            (signal_name, created_by, features, target_horizon, is_r_squared, oos_r_squared, intercept, coefficients, oos_bucket_data)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (signal_name) DO UPDATE SET
+                            is_r_squared = EXCLUDED.is_r_squared,
+                            oos_r_squared = EXCLUDED.oos_r_squared,
+                            coefficients = EXCLUDED.coefficients,
+                            oos_bucket_data = EXCLUDED.oos_bucket_data;
+                            """,
+                            (sanitized_name, req.userId, valid_features, req.target, is_r2, oos_r2, float(model.intercept_), Json(feature_weights), Json(oos_bucket_stats))
+                        )
+                        conn.commit()
+                        saved_to_db = True
+                except Exception as db_ex:
+                    conn.rollback()
+                    db_error = str(db_ex)
+                finally:
+                    conn.close()
 
         return {
             "status": "success",
-            "rSquared": r_squared,
-            "intercept": float(model.intercept_),
-            "coefficients": feature_weights,
             "signalName": sanitized_name,
-            "message": f"Successfully cached OLS target metric under key string '{sanitized_name}'."
+            "isRSquared": is_r2,
+            "oosRSquared": oos_r2,
+            "intercept": float(model.intercept_),
+            "hasSufficientCoverage": has_sufficient_coverage,
+            "savedToCloudDatabase": saved_to_db,
+            "databaseError": db_error,
+            "coefficients": feature_weights,
+            "message": f"Successfully calculated tracking metrics under name '{sanitized_name}'."
         }
-        
     except Exception as e:
         return {"error": f"Regression Engine failure validation block: {str(e)}"}
 
@@ -200,12 +268,10 @@ def calculate_buckets(req: BucketRequest):
     """
     df = datasets.get(req.dataset, pd.DataFrame()).copy()
     total_rows = len(df)
-    
     if df.empty:
         return {"buckets": [], "filteredRows": 0, "totalRows": 0}
 
     # ── NEW: DIRECTIONAL SIDE FILTERING BLOCK ──
-    # If the user selects Buy (1) or Sell (-1), mask rows to isolate that specific sub-market execution flow
     if req.side in [1, -1] and "side" in df.columns:
         df = df[df["side"] == req.side]
 
@@ -217,30 +283,27 @@ def calculate_buckets(req: BucketRequest):
             df = df[np.isin(b_indices, f.selectedBuckets)]
 
     filtered_rows = len(df)
-    
+
     # Check if target column exists (including dynamic OLS variable columns)
     if req.alphaId not in df.columns:
         return {
             "error": f"Metric key '{req.alphaId}' not initialized. If custom, execute regression first.",
             "buckets": [], "filteredRows": 0, "totalRows": total_rows
         }
-
     if filtered_rows == 0:
         return {"buckets": [], "filteredRows": 0, "totalRows": total_rows}
 
     # Compute quantile boundary cuts
     sorted_cuts = sorted(req.thresholds)
     df['bucket_idx'] = np.searchsorted(sorted_cuts, pd.to_numeric(df[req.alphaId], errors='coerce').fillna(0))
-    
     bucket_stats = []
     num_expected_buckets = len(sorted_cuts) + 1
-    
-    # Process return metrics across available data columns
+
+    # Process return metrics across available data columns (scaled to bps by multiplying by 100)
     for b_id in range(num_expected_buckets):
         b_df = df[df['bucket_idx'] == b_id]
         count = len(b_df)
         
-        # ── THE FIX: EXTRACT INDEX 0 FROM THE CUTS LIST FOR THE LOWER BOUND ──
         if b_id == 0:
             lbl = f"[-inf, {sorted_cuts[0]:.2f}]" if sorted_cuts else "All"
         elif b_id == len(sorted_cuts):
@@ -263,7 +326,7 @@ def calculate_buckets(req: BucketRequest):
         "totalRows": total_rows
     }
 
-# ── 5. STATIC WORKSPACE CLIENT ASSET MOUNT (MUST BE LAST) ──
+# ── 6. STATIC WORKSPACE CLIENT ASSET MOUNT (MUST BE LAST) ──
 if os.path.exists("./dist"):
     print("Production build distribution located. Launching combined web engine port...")
     app.mount("/assets", StaticFiles(directory="./dist/assets"), name="assets")
@@ -271,3 +334,6 @@ if os.path.exists("./dist"):
     @app.get("/{catchall:path}")
     def serve_frontend(catchall: str):
         return FileResponse("./dist/index.html")
+else:
+    print("Notice: './dist' folder not found. Server running in API-only mode.")
+
