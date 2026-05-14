@@ -173,8 +173,9 @@ def calculate_buckets(req: BucketRequest):
         b_df = df[df['bucket_idx'] == b_id]
         count = len(b_df)
         
+        # ── THE FIX: EXTRACT INDEX 0 FROM THE CUTS LIST FOR THE LOWER BOUND ──
         if b_id == 0:
-            lbl = f"[-inf, {sorted_cuts:.2f}]" if sorted_cuts else "All"
+            lbl = f"[-inf, {sorted_cuts[0]:.2f}]" if sorted_cuts else "All"
         elif b_id == len(sorted_cuts):
             lbl = f"[{sorted_cuts[-1]:.2f}, +inf]"
         else:
