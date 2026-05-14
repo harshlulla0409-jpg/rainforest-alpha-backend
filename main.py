@@ -185,9 +185,9 @@ def calculate_buckets(req: BucketRequest):
             "bucketIndex": b_id,
             "label": lbl,
             "n": count,
-            "r60": float(b_df['r60'].mean()) if count > 0 and not np.isnan(b_df['r60'].mean()) else 0.0,
-            "r300": float(b_df['r300'].mean()) if count > 0 and not np.isnan(b_df['r300'].mean()) else 0.0,
-            "r1800": float(b_df['r1800'].mean()) if count > 0 and not np.isnan(b_df['r1800'].mean()) else 0.0,
+            "r60": float(b_df['r60'].mean() * 100) if count > 0 and not np.isnan(b_df['r60'].mean()) else 0.0,
+            "r300": float(b_df['r300'].mean() * 100) if count > 0 and not np.isnan(b_df['r300'].mean()) else 0.0,
+            "r1800": float(b_df['r1800'].mean() * 100) if count > 0 and not np.isnan(b_df['r1800'].mean()) else 0.0,
         })
 
     return {
