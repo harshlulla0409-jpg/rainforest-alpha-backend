@@ -15,20 +15,24 @@ from sklearn.linear_model import LinearRegression
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # In production, replace with "https://rainforest-trading.com"
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=600, # Caches pre-flight responses for 10 minutes to reduce network delay
-)
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    # Handle preflight OPTIONS requests immediately on the fly
+    if request.method == "OPTIONS":
+        response = Response(status_code=204)
+        response.headers["Access-Control-Allow-Origin"] = "https://rainforest-trading.com"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
 
-@app.options("/{catchall:path}")
-def preflight_handler(catchall: str):
-    """Explicitly responds to browser pre-flight validation requests."""
-    return {"status": "ok"}
+    # Process all other normal traffic requests (GET, POST, etc.)
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "https://rainforest-trading.com"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
 
 # ── 2. NEW PRODUCTION SCHEMA DATA INGESTION ENGINE ──
 DB_PATH = "./data/your_alpha_data.csv"
