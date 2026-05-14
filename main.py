@@ -3,7 +3,7 @@ import json
 import requests
 import psycopg2
 from psycopg2.extras import Json
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response  # <-- FIXED: Explicitly imports Request and Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +15,7 @@ from sklearn.linear_model import LinearRegression
 
 app = FastAPI()
 
+# ── 1. NATIVE CORS INTERCEPTOR MIDDLEWARE LAYER ──
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     # Handle preflight OPTIONS requests immediately on the fly
