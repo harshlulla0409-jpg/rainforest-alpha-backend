@@ -15,26 +15,13 @@ from sklearn.linear_model import LinearRegression
 
 app = FastAPI()
 
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    # Handle preflight OPTIONS requests immediately on the fly
-    if request.method == "OPTIONS":
-        response = Response(status_code=204)
-        response.headers["Access-Control-Allow-Origin"] = "https://rainforest-trading.com"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        # THE FIX: Explicitly tell the browser it is allowed to send JSON headers
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        return response
-
-    # Process all other normal traffic requests (GET, POST, etc.)
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "https://rainforest-trading.com"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    # THE FIX: Explicitly tell the browser it is allowed to send JSON headers
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://rainforest-trading.com"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+)
 
 # ── 2. NEW PRODUCTION SCHEMA DATA INGESTION ENGINE ──
 DB_PATH = "./data/your_alpha_data.csv"
@@ -121,7 +108,7 @@ def github_authentication_handshake(req: AuthRequest):
         }
         
         token_res = requests.post(
-            "github.com",
+            "https://github.com/login/oauth/access_token",
             headers={"Accept": "application/json"},
             data=payload_data # Form urlencoded parameter injection
         ).json()
@@ -130,11 +117,12 @@ def github_authentication_handshake(req: AuthRequest):
         if not access_token:
             # Prints out GitHub's explicit reason to your Railway log terminal window
             print(f"GitHub Rejection Reason Payload: {token_res}")
-            return {"status": "error", "message": f"Handshake rejection: {token_res.get('error_description', 'Invalid client configuration tokens.')}"}
+            # Include GitHub's exact error message so the frontend logs why it failed
+            return {"status": "error", "message": f"Failed to exchange security authorization code token. Reason: {token_res.get('error_description', token_res)}"}
 
         # Fetch profile
         user_profile = requests.get(
-            "github.com",
+            "https://api.github.com/user",
             headers={"Authorization": f"token {access_token}", "Accept": "application/json"}
         ).json()
         
@@ -328,18 +316,17 @@ def calculate_buckets(req: BucketRequest):
         "totalRows": total_rows
     }
 
-@app.get("/api/strategies/save") # Replaced with standard handler framework
 @app.post("/api/strategies/save")
 def save_custom_strategy(req: SaveStrategyRequest):
     """
     Explicitly saves the calculated model parameters alongside the exact 
     alpha slider cuts and bucket definitions active in the workspace panels.
     """
-    conn = get_db_connection()
-    if not conn:
-        return {"status": "error", "message": "Cloud database connection credentials unavailable."}
-        
     try:
+        conn = get_db_connection()
+        if not conn:
+            return {"status": "error", "message": "Cloud database connection credentials unavailable."}
+            
         # Convert Pydantic schemas to JSON strings for Postgres injection
         coefficients_json = Json(req.coefficients)
         bucket_data_json = Json(req.oosBucketData)
@@ -377,21 +364,23 @@ def save_custom_strategy(req: SaveStrategyRequest):
             conn.commit()
             return {"status": "success", "message": f"Strategy '{req.signalName}' and its exact configuration levels logged to the cloud vault."}
     except Exception as e:
-        conn.rollback()
+        if 'conn' in locals() and conn:
+            conn.rollback()
         return {"status": "error", "message": f"Database write transaction failure: {str(e)}"}
     finally:
-        conn.close()
+        if 'conn' in locals() and conn:
+            conn.close()
 
 @app.get("/api/strategies")
 def get_user_strategies(userId: str):
     """
     Retrieves all archived alpha trading strategies belonging to a specific authenticated user account.
     """
-    conn = get_db_connection()
-    if not conn:
-        return {"status": "error", "message": "Cloud database credentials unavailable."}
-        
     try:
+        conn = get_db_connection()
+        if not conn:
+            return {"status": "error", "message": "Cloud database credentials unavailable."}
+            
         with conn.cursor() as cur:
             # Query columns, transforming JSONB arrays cleanly into dictionary results
             cur.execute(
@@ -425,7 +414,8 @@ def get_user_strategies(userId: str):
     except Exception as e:
         return {"status": "error", "message": f"Database read failure: {str(e)}"}
     finally:
-        conn.close()
+        if 'conn' in locals() and conn:
+            conn.close()
 
 # ── 6. STATIC WORKSPACE CLIENT ASSET MOUNT (MUST BE LAST) ──
 if os.path.exists("./dist"):
@@ -437,4 +427,3 @@ if os.path.exists("./dist"):
         return FileResponse("./dist/index.html")
 else:
     print("Notice: './dist' folder not found. Server running in API-only mode.")
-
