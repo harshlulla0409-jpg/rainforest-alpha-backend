@@ -75,6 +75,23 @@ class RegressionRequest(BaseModel):
     target: str                       # Can accept any column key: r5, r10, r60, r1800, etc.
     name: str = Field(default="custom_alpha")
 
+class SavedAlphaLevel(BaseModel):
+    alphaId: str
+    thresholds: List[float]       # The full array of slider cuts (e.g., [-2.0, 0.0, 5.0, 10.0])
+    selectedBuckets: List[int]    # The specific bucket indices the user clicked
+
+class SaveStrategyRequest(BaseModel):
+    userId: str
+    signalName: str
+    targetHorizon: str
+    features: List[str]
+    isRSquared: float
+    oosRSquared: float
+    intercept: float
+    coefficients: Dict[str, float]
+    oosBucketData: List[Dict[str, Any]]
+    activeWorkspaceLevels: List[SavedAlphaLevel]
+
 # ── 5. PRODUCTION ENDPOINT ROUTING MANAGEMENT ──
 
 @app.post("/api/auth/github")
@@ -147,8 +164,8 @@ def get_meta():
 @app.post("/api/regression")
 def run_alpha_regression(req: RegressionRequest):
     """
-    Fits an OLS Linear Regression on In-Sample (IS) data, computes metrics on 
-    Out-of-Sample (OOS) data, and saves to the database if OOS R2 > 20% and coverage > 1%.
+    Fits an OLS Linear Regression on In-Sample (IS) data and evaluates on Out-of-Sample (OOS).
+    Returns ALL calculation metrics to the frontend WITHOUT saving to the database.
     """
     df_is = datasets.get("is")
     df_oos = datasets.get("oos")
@@ -157,14 +174,12 @@ def run_alpha_regression(req: RegressionRequest):
         return {"error": "Insufficient data arrays or empty feature selection parameters provided."}
         
     try:
-        # Verify columns exist in current dataframe schema layout
         valid_features = [f for f in req.features if f in df_is.columns]
         if not valid_features:
             return {"error": "None of the chosen tracking alphas were discovered inside the database."}
         if req.target not in df_is.columns:
             return {"error": f"Target horizon matrix '{req.target}' is missing from the dataset schemas."}
 
-        # Step A: Extract matrices and train OLS model strictly on In-Sample (IS) data
         X_train = df_is[valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
         y_train = pd.to_numeric(df_is[req.target], errors='coerce').fillna(0)
         
@@ -172,23 +187,19 @@ def run_alpha_regression(req: RegressionRequest):
         model.fit(X_train, y_train)
         is_r2 = float(model.score(X_train, y_train)) * 100
 
-        # Step B: Generate signal predictions and compute score on Out-of-Sample (OOS) data
         X_test = df_oos[valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
         y_test = pd.to_numeric(df_oos[req.target], errors='coerce').fillna(0)
         oos_r2 = float(model.score(X_test, y_test)) * 100
 
-        # Sanitize target signature token label
         sanitized_name = "".join([c for c in req.name if c.isalnum() or c == "_"])
         if not sanitized_name:
             sanitized_name = "custom_alpha"
 
-        # Apply computed beta weights matrix to save the new dynamic tracking row in memory
         for split_key in ["is", "oos"]:
             if not datasets[split_key].empty:
                 X_slice = datasets[split_key][valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
                 datasets[split_key][sanitized_name] = model.predict(X_slice)
 
-        # Step C: Evaluate Out-of-Sample (OOS) data bucket distribution density (10 quantiles)
         df_oos_eval = datasets["oos"].copy()
         df_oos_eval['bucket_idx'] = pd.qcut(df_oos_eval[sanitized_name], q=10, labels=False, duplicates='drop')
         
@@ -201,7 +212,6 @@ def run_alpha_regression(req: RegressionRequest):
             count = len(b_df)
             coverage_pct = (count / oos_total_rows) * 100
             
-            # CRITERIA CHECK: Verify each individual bucket contains > 1% data coverage
             if coverage_pct <= 1.0:
                 has_sufficient_coverage = False
 
@@ -214,48 +224,20 @@ def run_alpha_regression(req: RegressionRequest):
                 "r1800_bps": float(b_df['r1800'].mean() * 100) if not np.isnan(b_df['r1800'].mean()) else 0.0,
             })
 
-        # Step D: CRITERIA CHECK - Trigger cloud archive if OOS R2 > 20% and bucket coverage > 1%
-        saved_to_db = False
-        db_error = None
         feature_weights = {feat: float(w) for feat, w in zip(valid_features, model.coef_)}
-        
-        if oos_r2 > 20.0 and has_sufficient_coverage:
-            conn = get_db_connection()
-            if conn:
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            INSERT INTO alpha_strategies 
-                            (signal_name, created_by, features, target_horizon, is_r_squared, oos_r_squared, intercept, coefficients, oos_bucket_data)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (signal_name) DO UPDATE SET
-                            is_r_squared = EXCLUDED.is_r_squared,
-                            oos_r_squared = EXCLUDED.oos_r_squared,
-                            coefficients = EXCLUDED.coefficients,
-                            oos_bucket_data = EXCLUDED.oos_bucket_data;
-                            """,
-                            (sanitized_name, req.userId, valid_features, req.target, is_r2, oos_r2, float(model.intercept_), Json(feature_weights), Json(oos_bucket_stats))
-                        )
-                        conn.commit()
-                        saved_to_db = True
-                except Exception as db_ex:
-                    conn.rollback()
-                    db_error = str(db_ex)
-                finally:
-                    conn.close()
 
+        # Return everything to frontend state so user can evaluate and push manually
         return {
             "status": "success",
             "signalName": sanitized_name,
+            "targetHorizon": req.target,
+            "features": valid_features,
             "isRSquared": is_r2,
             "oosRSquared": oos_r2,
             "intercept": float(model.intercept_),
-            "hasSufficientCoverage": has_sufficient_coverage,
-            "savedToCloudDatabase": saved_to_db,
-            "databaseError": db_error,
             "coefficients": feature_weights,
-            "message": f"Successfully calculated tracking metrics under name '{sanitized_name}'."
+            "hasSufficientCoverage": has_sufficient_coverage,
+            "oosBucketData": oos_bucket_stats
         }
     except Exception as e:
         return {"error": f"Regression Engine failure validation block: {str(e)}"}
@@ -325,6 +307,60 @@ def calculate_buckets(req: BucketRequest):
         "filteredRows": filtered_rows,
         "totalRows": total_rows
     }
+
+@app.get("/api/strategies/save") # Replaced with standard handler framework
+@app.post("/api/strategies/save")
+def save_custom_strategy(req: SaveStrategyRequest):
+    """
+    Explicitly saves the calculated model parameters alongside the exact 
+    alpha slider cuts and bucket definitions active in the workspace panels.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return {"status": "error", "message": "Cloud database connection credentials unavailable."}
+        
+    try:
+        # Convert Pydantic schemas to JSON strings for Postgres injection
+        coefficients_json = Json(req.coefficients)
+        bucket_data_json = Json(req.oosBucketData)
+        
+        # Serialize the frontend level configurations array cleanly
+        levels_payload = [level.model_dump() for level in req.activeWorkspaceLevels]
+        levels_json = Json(levels_payload)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO alpha_strategies 
+                (signal_name, created_by, features, target_horizon, is_r_squared, oos_r_squared, intercept, coefficients, oos_bucket_data, active_workspace_levels)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (signal_name) DO UPDATE SET
+                is_r_squared = EXCLUDED.is_r_squared,
+                oos_r_squared = EXCLUDED.oos_r_squared,
+                coefficients = EXCLUDED.coefficients,
+                oos_bucket_data = EXCLUDED.oos_bucket_data,
+                active_workspace_levels = EXCLUDED.active_workspace_levels;
+                """,
+                (
+                    req.signalName, 
+                    req.userId, 
+                    req.features, 
+                    req.targetHorizon, 
+                    req.isRSquared, 
+                    req.oosRSquared, 
+                    req.intercept, 
+                    coefficients_json, 
+                    bucket_data_json,
+                    levels_json
+                )
+            )
+            conn.commit()
+            return {"status": "success", "message": f"Strategy '{req.signalName}' and its exact configuration levels logged to the cloud vault."}
+    except Exception as e:
+        conn.rollback()
+        return {"status": "error", "message": f"Database write transaction failure: {str(e)}"}
+    finally:
+        conn.close()
 
 # ── 6. STATIC WORKSPACE CLIENT ASSET MOUNT (MUST BE LAST) ──
 if os.path.exists("./dist"):
