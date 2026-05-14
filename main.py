@@ -15,14 +15,20 @@ from sklearn.linear_model import LinearRegression
 
 app = FastAPI()
 
-# ── 1. CONFIGURE SECURITY CORS HANDSHAKES ──
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # In production, replace with "https://rainforest-trading.com"
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600, # Caches pre-flight responses for 10 minutes to reduce network delay
 )
+
+@app.options("/{catchall:path}")
+def preflight_handler(catchall: str):
+    """Explicitly responds to browser pre-flight validation requests."""
+    return {"status": "ok"}
 
 # ── 2. NEW PRODUCTION SCHEMA DATA INGESTION ENGINE ──
 DB_PATH = "./data/your_alpha_data.csv"
@@ -96,33 +102,41 @@ class SaveStrategyRequest(BaseModel):
 
 @app.post("/api/auth/github")
 def github_authentication_handshake(req: AuthRequest):
-    """
-    Exchanges GitHub OAuth codes for access token hashes.
-    Stores and returns unique user identifier credentials.
-    """
     client_id = os.getenv("GITHUB_CLIENT_ID")
     client_secret = os.getenv("GITHUB_CLIENT_SECRET")
+    
     try:
-        # Step A: Exchange the code for a GitHub Access Token
+        # THE FIX: GitHub's API strictly requires payload mapping to be sent over form parameters
+        payload_data = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": req.code,
+            "redirect_uri": "https://rainforest-trading.com" # Explicitly matches your custom domain callback
+        }
+        
         token_res = requests.post(
-            "https://github.com/login/oauth/access_token",
+            "github.com",
             headers={"Accept": "application/json"},
-            data={"client_id": client_id, "client_secret": client_secret, "code": req.code}
+            data=payload_data # Form urlencoded parameter injection
         ).json()
+        
         access_token = token_res.get("access_token")
         if not access_token:
-            return {"status": "error", "message": "Failed to exchange security authorization code token."}
+            # Prints out GitHub's explicit reason to your Railway log terminal window
+            print(f"GitHub Rejection Reason Payload: {token_res}")
+            return {"status": "error", "message": f"Handshake rejection: {token_res.get('error_description', 'Invalid client configuration tokens.')}"}
 
-        # Step B: Fetch the user's public profile data using the access token
+        # Fetch profile
         user_profile = requests.get(
-            "https://api.github.com/user",
-            headers={"Authorization": f"token {access_token}"}
+            "github.com",
+            headers={"Authorization": f"token {access_token}", "Accept": "application/json"}
         ).json()
+        
         github_id = str(user_profile.get("id"))
         username = user_profile.get("login")
         avatar_url = user_profile.get("avatar_url")
 
-        # Step C: Save or update the user inside your Supabase database instance
+        # Sync profile to Supabase app_users table
         try:
             conn = get_db_connection()
             if conn:
@@ -140,7 +154,7 @@ def github_authentication_handshake(req: AuthRequest):
                     conn.commit()
                     conn.close()
         except Exception as db_err:
-            print(f"WARNING: Database issue during auth tracking: {db_err}")
+            print(f"Database sync warning: {db_err}")
 
         return {
             "status": "success",
@@ -406,7 +420,6 @@ def get_user_strategies(userId: str):
         return {"status": "error", "message": f"Database read failure: {str(e)}"}
     finally:
         conn.close()
-
 
 # ── 6. STATIC WORKSPACE CLIENT ASSET MOUNT (MUST BE LAST) ──
 if os.path.exists("./dist"):
