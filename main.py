@@ -84,10 +84,10 @@ def calculate_buckets(req: BucketRequest):
     sorted_cuts = sorted(req.thresholds)
     df['bucket_idx'] = np.searchsorted(sorted_cuts, df[req.alphaId])
     
+      # Process return averages bucket by bucket inside memory matrix paths
     bucket_stats = []
     num_expected_buckets = len(sorted_cuts) + 1
     
-    # Process return averages bucket by bucket inside memory matrix paths
     for b_id in range(num_expected_buckets):
         b_df = df[df['bucket_idx'] == b_id]
         count = len(b_df)
@@ -100,15 +100,14 @@ def calculate_buckets(req: BucketRequest):
         else:
             lbl = f"[{sorted_cuts[b_id-1]:.2f}, {sorted_cuts[b_id]:.2f}]"
 
+        # ── EXACT FRONTEND KEY PAIRS CONFIGURATION ──
         bucket_stats.append({
             "bucketIndex": b_id,
             "label": lbl,
-            "count": count,
-            "metrics": {
-                "r60": float(b_df['r60'].mean()) if count > 0 and not np.isnan(b_df['r60'].mean()) else 0.0,
-                "r300": float(b_df['r300'].mean()) if count > 0 and not np.isnan(b_df['r300'].mean()) else 0.0,
-                "r1800": float(b_df['r1800'].mean()) if count > 0 and not np.isnan(b_df['r1800'].mean()) else 0.0,
-            }
+            "n": count,  # Maps directly to b.n
+            "r60": float(b_df['r60'].mean()) if count > 0 and not np.isnan(b_df['r60'].mean()) else 0.0,  # Maps to b.r60
+            "r300": float(b_df['r300'].mean()) if count > 0 and not np.isnan(b_df['r300'].mean()) else 0.0,
+            "r1800": float(b_df['r1800'].mean()) if count > 0 and not np.isnan(b_df['r1800'].mean()) else 0.0,
         })
 
     return {
@@ -116,7 +115,7 @@ def calculate_buckets(req: BucketRequest):
         "filteredRows": filtered_rows,
         "totalRows": total_rows
     }
-
+ 
 # ── 5. STATIC WORKSPACE CLIENT ROUTING (MUST BE LAST) ──
 if os.path.exists("./dist"):
     print("Static build directory located. Mounting frontend web assets...")
