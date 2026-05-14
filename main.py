@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from typing import List
 import pandas as pd
 import numpy as np
+from pydantic import BaseModel
+from sklearn.linear_model import LinearRegression
 
 app = FastAPI()
 
@@ -45,6 +47,10 @@ class BucketRequest(BaseModel):
     alphaId: str             # Active metric being bucketed
     thresholds: List[float]  # Custom boundary thresholds set by user sliders
     upstreamFilters: List[UpstreamFilter]  # Parent panel segmentations
+class RegressionRequest(BaseModel):
+    dataset: str         # "is" or "oos"
+    features: List[str]  # e.g., ["obi_pressure", "trade_flow_imb"]
+    target: str          # "r60", "r300", or "r1800"
 
 # ── 4. LIVE API ENDPOINTS (MUST BE DECLARED FIRST) ──
 
@@ -115,6 +121,62 @@ def calculate_buckets(req: BucketRequest):
         "filteredRows": filtered_rows,
         "totalRows": total_rows
     }
+
+@app.post("/api/regression")
+def run_alpha_regression(req: RegressionRequest):
+    """
+    Runs an Ordinary Least Squares (OLS) Linear Regression natively on the server.
+    Saves a dynamic combined tracking metric column inside memory data matrices.
+    """
+    # Grab the current split environment arrays
+    df_is = datasets.get("is")
+    df_oos = datasets.get("oos")
+    
+    if df_is is None or df_is.empty or not req.features:
+        return {"error": "Invalid training conditions or empty feature selection matrix provided."}
+        
+    try:
+        # Validate that selected feature string tokens exist in database schemas
+        valid_features = [f for f in req.features if f in df_is.columns]
+        if not valid_features:
+            return {"error": "None of the selected alpha tracking features were found in the database."}
+
+        # 1. Extract feature data slices and targets from the In-Sample training slice
+        X_train = df_is[valid_features].fillna(0)
+        y_train = df_is[req.target].fillna(0)
+        
+        # 2. Train the linear regression model
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        
+        # 3. Calculate model fit score (R-squared)
+        r_squared = float(model.score(X_train, y_train))
+        
+        # 4. Generate the optimized combined trading signal for both data splits
+        # This creates the new temporary column dynamically inside server memory
+        for split_key in ["is", "oos"]:
+            target_df = datasets[split_key]
+            if not target_df.empty:
+                X_slice = target_df[valid_features].fillna(0)
+                # Compute dot-product weights and overwrite custom tracking label fields
+                datasets[split_key]["custom_regression_signal"] = model.predict(X_slice)
+
+        # 5. Format coefficients into a clean dictionary map for the front-end display
+        feature_weights = {}
+        for feature_name, coeff_val in zip(valid_features, model.coef_):
+            feature_weights[feature_name] = float(coeff_val)
+
+        return {
+            "status": "success",
+            "rSquared": r_squared,
+            "intercept": float(model.intercept_),
+            "coefficients": feature_weights,
+            "message": "Custom tracking signal 'custom_regression_signal' calculated across data matrix maps."
+        }
+        
+    except Exception as e:
+        return {"error": f"Mathematical engine calculation exception occurred: {str(e)}"}
+
  
 # ── 5. STATIC WORKSPACE CLIENT ROUTING (MUST BE LAST) ──
 if os.path.exists("./dist"):
