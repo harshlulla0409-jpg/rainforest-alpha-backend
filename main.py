@@ -362,6 +362,52 @@ def save_custom_strategy(req: SaveStrategyRequest):
     finally:
         conn.close()
 
+@app.get("/api/strategies")
+def get_user_strategies(userId: str):
+    """
+    Retrieves all archived alpha trading strategies belonging to a specific authenticated user account.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return {"status": "error", "message": "Cloud database credentials unavailable."}
+        
+    try:
+        with conn.cursor() as cur:
+            # Query columns, transforming JSONB arrays cleanly into dictionary results
+            cur.execute(
+                """
+                SELECT id, signal_name, features, target_horizon, is_r_squared, oos_r_squared, intercept, coefficients, oos_bucket_data, active_workspace_levels, created_at 
+                FROM alpha_strategies 
+                WHERE created_by = %s
+                ORDER BY oos_r_squared DESC;
+                """,
+                (userId,)
+            )
+            rows = cur.fetchall()
+            
+        strategies_list = []
+        for r in rows:
+            strategies_list.append({
+                "id": r[0],
+                "signalName": r[1],
+                "features": r[2],
+                "targetHorizon": r[3],
+                "isRSquared": r[4],
+                "oosRSquared": r[5],
+                "intercept": r[6],
+                "coefficients": r[7], # Automatically parsed as Dict via psycopg2 JSONB
+                "oosBucketData": r[8], # Automatically parsed as List via psycopg2 JSONB
+                "activeWorkspaceLevels": r[9], # Contains the exact slider cut thresholds
+                "createdAt": r[10].isoformat() if r[10] else None
+            })
+            
+        return {"status": "success", "strategies": strategies_list}
+    except Exception as e:
+        return {"status": "error", "message": f"Database read failure: {str(e)}"}
+    finally:
+        conn.close()
+
+
 # ── 6. STATIC WORKSPACE CLIENT ASSET MOUNT (MUST BE LAST) ──
 if os.path.exists("./dist"):
     print("Production build distribution located. Launching combined web engine port...")
