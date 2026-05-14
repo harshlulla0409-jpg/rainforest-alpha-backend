@@ -1,0 +1,6 @@
+node_modules/
+.vite/
+.env
+dist/
+*.tar.gz
+server.log
