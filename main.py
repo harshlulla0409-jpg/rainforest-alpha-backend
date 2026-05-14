@@ -15,7 +15,6 @@ from sklearn.linear_model import LinearRegression
 
 app = FastAPI()
 
-# ── 1. NATIVE CORS INTERCEPTOR MIDDLEWARE LAYER ──
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     # Handle preflight OPTIONS requests immediately on the fly
@@ -23,7 +22,8 @@ async def add_cors_headers(request: Request, call_next):
         response = Response(status_code=204)
         response.headers["Access-Control-Allow-Origin"] = "https://rainforest-trading.com"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        # THE FIX: Explicitly tell the browser it is allowed to send JSON headers
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
         response.headers["Access-Control-Allow-Credentials"] = "true"
         return response
 
@@ -31,7 +31,8 @@ async def add_cors_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["Access-Control-Allow-Origin"] = "https://rainforest-trading.com"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
+    # THE FIX: Explicitly tell the browser it is allowed to send JSON headers
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
     response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
