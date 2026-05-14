@@ -1,4 +1,5 @@
 import os
+import requests
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -44,6 +45,9 @@ except Exception as e:
     datasets = {"is": pd.DataFrame(), "oos": pd.DataFrame()}
 
 # ── 3. DATA PROTOCOL SCHEMAS ──
+class AuthRequest(BaseModel):
+    code: str
+
 class UpstreamFilter(BaseModel):
     alphaId: str
     thresholds: List[float]
@@ -63,6 +67,69 @@ class RegressionRequest(BaseModel):
     name: str = Field(default="custom_alpha")
 
 # ── 4. PRODUCTION ENDPOINT ROUTING MANAGEMENT ──
+
+@app.post("/api/auth/github")
+def github_authentication_handshake(req: AuthRequest):
+    """
+    Exchanges GitHub OAuth codes for access token hashes.
+    Stores and returns unique user identifier credentials.
+    """
+    # Grab your secure OAuth keys from your Railway environment configuration variables panel
+    client_id = os.getenv("GITHUB_CLIENT_ID")
+    client_secret = os.getenv("GITHUB_CLIENT_SECRET")
+    
+    try:
+        # Step A: Exchange the code for a GitHub Access Token
+        token_res = requests.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            data={"client_id": client_id, "client_secret": client_secret, "code": req.code}
+        ).json()
+        
+        access_token = token_res.get("access_token")
+        if not access_token:
+            return {"status": "error", "message": "Failed to exchange security authorization code token."}
+            
+        # Step B: Fetch the user's public profile data using the access token
+        user_profile = requests.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"token {access_token}"}
+        ).json()
+        
+        github_id = str(user_profile.get("id"))
+        username = user_profile.get("login")
+        avatar_url = user_profile.get("avatar_url")
+        
+        # Step C: Save or update the user inside your Supabase database instance
+        try:
+            conn = get_db_connection()
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO app_users (github_id, username, avatar_url)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (github_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        avatar_url = EXCLUDED.avatar_url;
+                        """,
+                        (github_id, username, avatar_url)
+                    )
+                    conn.commit()
+                    conn.close()
+        except NameError:
+            print("WARNING: get_db_connection() is undefined. User not saved to DB.")
+                
+        return {
+            "status": "success",
+            "user": {
+                "id": github_id,
+                "username": username,
+                "avatarUrl": avatar_url
+            }
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"OAuth handshake failure: {str(e)}"}
 
 @app.get("/api/data/meta")
 def get_meta():
@@ -93,7 +160,7 @@ def run_alpha_regression(req: RegressionRequest):
 
         # Handle numeric casts safely
         X_train = df_is[valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
-        y_train = pd.to_numeric(df_is[req.target], errors='coerce').fillna(0)
+        y_train = pd.to_numeric(df_is[req.target], errors='coerce').fillna(0) * 100
         
         # Fit SciKit-Learn Regression Engine
         model = LinearRegression()
@@ -204,4 +271,3 @@ if os.path.exists("./dist"):
     @app.get("/{catchall:path}")
     def serve_frontend(catchall: str):
         return FileResponse("./dist/index.html")
-
