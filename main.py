@@ -51,6 +51,7 @@ class UpstreamFilter(BaseModel):
 
 class BucketRequest(BaseModel):
     dataset: str
+    side: int                # Accepts: 1 (Buys), -1 (Sells), or 0 (All Sides)
     alphaId: str
     thresholds: List[float]
     upstreamFilters: List[UpstreamFilter]
@@ -126,14 +127,22 @@ def run_alpha_regression(req: RegressionRequest):
 
 @app.post("/api/buckets")
 def calculate_buckets(req: BucketRequest):
-    """Slices HFT rows into custom bucket brackets and extracts forward returns metrics."""
+    """
+    Slices HFT rows into custom bucket brackets.
+    Applies execution direction side filtering before executing cascade filters.
+    """
     df = datasets.get(req.dataset, pd.DataFrame()).copy()
     total_rows = len(df)
     
     if df.empty:
         return {"buckets": [], "filteredRows": 0, "totalRows": 0}
 
-    # Apply parent / conditional filter trees
+    # ── NEW: DIRECTIONAL SIDE FILTERING BLOCK ──
+    # If the user selects Buy (1) or Sell (-1), mask rows to isolate that specific sub-market execution flow
+    if req.side in [1, -1] and "side" in df.columns:
+        df = df[df["side"] == req.side]
+
+    # Apply parent / cascade metric filtering panels
     for f in req.upstreamFilters:
         if f.alphaId in df.columns and len(f.thresholds) > 0:
             sorted_thresh = sorted(f.thresholds)
@@ -142,6 +151,7 @@ def calculate_buckets(req: BucketRequest):
 
     filtered_rows = len(df)
     
+    # Check if target column exists (including dynamic OLS variable columns)
     if req.alphaId not in df.columns:
         return {
             "error": f"Metric key '{req.alphaId}' not initialized. If custom, execute regression first.",
@@ -170,7 +180,6 @@ def calculate_buckets(req: BucketRequest):
         else:
             lbl = f"[{sorted_cuts[b_id-1]:.2f}, {sorted_cuts[b_id]:.2f}]"
 
-        # Explicitly maps standard horizons. Missing/invalid floats resolve to 0.0
         bucket_stats.append({
             "bucketIndex": b_id,
             "label": lbl,
