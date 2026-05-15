@@ -229,11 +229,12 @@ def run_alpha_regression(req: RegressionRequest):
 
             oos_bucket_stats.append({
                 "bucketIndex": int(b_id),
-                "count": count,
+                "label": f"Bucket {int(b_id)}", # Added a fallback label just in case React wants it
+                "n": count,                     # Changed from "count" to "n"
                 "coveragePct": round(coverage_pct, 2),
-                "r60_bps": float(b_df['r60'].mean() * 100) if not np.isnan(b_df['r60'].mean()) else 0.0,
-                "r300_bps": float(b_df['r300'].mean() * 100) if not np.isnan(b_df['r300'].mean()) else 0.0,
-                "r1800_bps": float(b_df['r1800'].mean() * 100) if not np.isnan(b_df['r1800'].mean()) else 0.0,
+                "r60": float(b_df['r60'].mean() * 100) if not np.isnan(b_df['r60'].mean()) else 0.0,       # Removed _bps
+                "r300": float(b_df['r300'].mean() * 100) if not np.isnan(b_df['r300'].mean()) else 0.0,    # Removed _bps
+                "r1800": float(b_df['r1800'].mean() * 100) if not np.isnan(b_df['r1800'].mean()) else 0.0, # Removed _bps
             })
 
         feature_weights = {feat: float(w) for feat, w in zip(valid_features, model.coef_)}
