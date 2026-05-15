@@ -67,6 +67,9 @@ class BucketRequest(BaseModel):
     alphaId: str
     thresholds: List[float]
     upstreamFilters: List[UpstreamFilter]
+    isCustomAlpha: bool = False
+    coefficients: Dict[str, float] = None
+    intercept: float = 0.0
 
 class RegressionRequest(BaseModel):
     userId: str                       # Appended automatically by authenticated frontend
@@ -204,10 +207,10 @@ def run_alpha_regression(req: RegressionRequest):
         if not sanitized_name:
             sanitized_name = "custom_alpha"
 
-        for split_key in ["is", "oos"]:
-            if not datasets[split_key].empty:
-                X_slice = datasets[split_key][valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
-                datasets[split_key][sanitized_name] = model.predict(X_slice)
+        # for split_key in ["is", "oos"]:
+        #     if not datasets[split_key].empty:
+        #         X_slice = datasets[split_key][valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
+        #         datasets[split_key][sanitized_name] = model.predict(X_slice)
 
         df_oos_eval = datasets["oos"].copy()
         df_oos_eval['bucket_idx'] = pd.qcut(df_oos_eval[sanitized_name], q=10, labels=False, duplicates='drop')
@@ -255,14 +258,14 @@ def run_alpha_regression(req: RegressionRequest):
 def calculate_buckets(req: BucketRequest):
     """
     Slices HFT rows into custom bucket brackets.
-    Applies execution direction side filtering before executing cascade filters.
+    Dynamically reconstructs custom OLS alphas in memory if coefficients are provided.
     """
     df = datasets.get(req.dataset, pd.DataFrame()).copy()
     total_rows = len(df)
     if df.empty:
         return {"buckets": [], "filteredRows": 0, "totalRows": 0}
 
-    # ── NEW: DIRECTIONAL SIDE FILTERING BLOCK ──
+    # ── DIRECTIONAL SIDE FILTERING BLOCK ──
     if req.side in [1, -1] and "side" in df.columns:
         df = df[df["side"] == req.side]
 
@@ -274,19 +277,29 @@ def calculate_buckets(req: BucketRequest):
             df = df[np.isin(b_indices, f.selectedBuckets)]
 
     filtered_rows = len(df)
-
-    # Check if target column exists (including dynamic OLS variable columns)
-    if req.alphaId not in df.columns:
-        return {
-            "error": f"Metric key '{req.alphaId}' not initialized. If custom, execute regression first.",
-            "buckets": [], "filteredRows": 0, "totalRows": total_rows
-        }
     if filtered_rows == 0:
         return {"buckets": [], "filteredRows": 0, "totalRows": total_rows}
 
-    # Compute quantile boundary cuts
+    # ── THE STATELESS ROUTER: Build the signal dynamically or use the hardcoded column ──
+    if req.isCustomAlpha and req.coefficients:
+        # Reconstruct the linear regression vector in RAM for this specific request
+        signal_series = pd.Series(req.intercept, index=df.index)
+        for feature, coef in req.coefficients.items():
+            if feature in df.columns:
+                signal_series += pd.to_numeric(df[feature], errors='coerce').fillna(0) * coef
+    else:
+        # Standard hardcoded feature
+        if req.alphaId not in df.columns:
+            return {
+                "error": f"Metric key '{req.alphaId}' not found. If custom, ensure coefficients are passed.",
+                "buckets": [], "filteredRows": 0, "totalRows": total_rows
+            }
+        signal_series = pd.to_numeric(df[req.alphaId], errors='coerce').fillna(0)
+
+    # Compute quantile boundary cuts using the dynamic signal_series
     sorted_cuts = sorted(req.thresholds)
-    df['bucket_idx'] = np.searchsorted(sorted_cuts, pd.to_numeric(df[req.alphaId], errors='coerce').fillna(0))
+    df['bucket_idx'] = np.searchsorted(sorted_cuts, signal_series)
+    
     bucket_stats = []
     num_expected_buckets = len(sorted_cuts) + 1
 
