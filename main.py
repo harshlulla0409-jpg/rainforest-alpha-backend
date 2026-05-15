@@ -87,6 +87,7 @@ class SaveStrategyRequest(BaseModel):
     isRSquared: float
     oosRSquared: float
     intercept: float
+    oosScore: float
     coefficients: Dict[str, float]
     oosBucketData: List[Dict[str, Any]]
     activeWorkspaceLevels: List[SavedAlphaLevel]
@@ -344,6 +345,7 @@ def save_custom_strategy(req: SaveStrategyRequest):
                 ON CONFLICT (signal_name) DO UPDATE SET
                 is_r_squared = EXCLUDED.is_r_squared,
                 oos_r_squared = EXCLUDED.oos_r_squared,
+		        oos_score = EXCLUDED.oos_score,
                 coefficients = EXCLUDED.coefficients,
                 oos_bucket_data = EXCLUDED.oos_bucket_data,
                 active_workspace_levels = EXCLUDED.active_workspace_levels;
@@ -355,7 +357,8 @@ def save_custom_strategy(req: SaveStrategyRequest):
                     req.targetHorizon, 
                     req.isRSquared, 
                     req.oosRSquared, 
-                    req.intercept, 
+                    req.intercept,
+		            req.oosScore, 
                     coefficients_json, 
                     bucket_data_json,
                     levels_json
@@ -385,7 +388,7 @@ def get_user_strategies(userId: str):
             # Query columns, transforming JSONB arrays cleanly into dictionary results
             cur.execute(
                 """
-                SELECT id, signal_name, features, target_horizon, is_r_squared, oos_r_squared, intercept, coefficients, oos_bucket_data, active_workspace_levels, created_at 
+                SELECT id, signal_name, features, target_horizon, is_r_squared, oos_r_squared, intercept, coefficients, oos_bucket_data, active_workspace_levels, created_at, oos_score 
                 FROM alpha_strategies 
                 WHERE created_by = %s
                 ORDER BY oos_r_squared DESC;
@@ -407,7 +410,8 @@ def get_user_strategies(userId: str):
                 "coefficients": r[7], # Automatically parsed as Dict via psycopg2 JSONB
                 "oosBucketData": r[8], # Automatically parsed as List via psycopg2 JSONB
                 "activeWorkspaceLevels": r[9], # Contains the exact slider cut thresholds
-                "createdAt": r[10].isoformat() if r[10] else None
+                "createdAt": r[10].isoformat() if r[10] else None,
+		        "oosScore": r[11] if len(r) > 11 and r[11] is not None else 0.0 # safely map the new column
             })
             
         return {"status": "success", "strategies": strategies_list}
