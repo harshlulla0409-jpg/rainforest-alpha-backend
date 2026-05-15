@@ -341,7 +341,7 @@ def save_custom_strategy(req: SaveStrategyRequest):
                 """
                 INSERT INTO alpha_strategies 
                 (signal_name, created_by, features, target_horizon, is_r_squared, oos_r_squared, intercept, coefficients, oos_bucket_data, active_workspace_levels)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (signal_name) DO UPDATE SET
                 is_r_squared = EXCLUDED.is_r_squared,
                 oos_r_squared = EXCLUDED.oos_r_squared,
