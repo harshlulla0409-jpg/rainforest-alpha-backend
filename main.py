@@ -193,14 +193,14 @@ def run_alpha_regression(req: RegressionRequest):
             return {"error": f"Target horizon matrix '{req.target}' is missing from the dataset schemas."}
 
         X_train = df_is[valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
-        y_train = pd.to_numeric(df_is[req.target], errors='coerce').fillna(0)
+        y_train = pd.to_numeric(df_is[req.target], errors='coerce').fillna(0) * 1000
         
         model = LinearRegression()
         model.fit(X_train, y_train)
         is_r2 = float(model.score(X_train, y_train)) * 100
 
         X_test = df_oos[valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
-        y_test = pd.to_numeric(df_oos[req.target], errors='coerce').fillna(0)
+        y_test = pd.to_numeric(df_oos[req.target], errors='coerce').fillna(0) * 1000
         oos_r2 = float(model.score(X_test, y_test)) * 100
 
         sanitized_name = "".join([c for c in req.name if c.isalnum() or c == "_"])
@@ -262,18 +262,30 @@ def run_alpha_regression(req: RegressionRequest):
 def calculate_buckets(req: BucketRequest):
     """
     Slices HFT rows into custom bucket brackets.
-    Dynamically reconstructs custom OLS alphas in memory if coefficients are provided.
+    Dynamically injects custom OLS alphas into the temporary dataframe.
     """
     df = datasets.get(req.dataset, pd.DataFrame()).copy()
     total_rows = len(df)
     if df.empty:
         return {"buckets": [], "filteredRows": 0, "totalRows": 0}
 
-    # ── DIRECTIONAL SIDE FILTERING BLOCK ──
+    # ── 1. THE STATELESS INJECTION ──
+    # If this is a custom alpha, build it in RAM immediately and attach it to df.
+    # Now it acts exactly like a native column for the rest of the function!
+    if req.isCustomAlpha and req.coefficients:
+        signal_series = pd.Series(req.intercept, index=df.index)
+        for feature, coef in req.coefficients.items():
+            if feature in df.columns:
+                signal_series += pd.to_numeric(df[feature], errors='coerce').fillna(0) * coef
+        
+        # Inject it into our temporary DataFrame
+        df[req.alphaId] = signal_series
+
+    # ── 2. DIRECTIONAL SIDE FILTERING ──
     if req.side in [1, -1] and "side" in df.columns:
         df = df[df["side"] == req.side]
 
-    # Apply parent / cascade metric filtering panels
+    # ── 3. CASCADE/UPSTREAM FILTERING ──
     for f in req.upstreamFilters:
         if f.alphaId in df.columns and len(f.thresholds) > 0:
             sorted_thresh = sorted(f.thresholds)
@@ -281,33 +293,18 @@ def calculate_buckets(req: BucketRequest):
             df = df[np.isin(b_indices, f.selectedBuckets)]
 
     filtered_rows = len(df)
-    if filtered_rows == 0:
+    if filtered_rows == 0 or req.alphaId not in df.columns:
         return {"buckets": [], "filteredRows": 0, "totalRows": total_rows}
 
-    # ── THE STATELESS ROUTER: Build the signal dynamically or use the hardcoded column ──
-    if req.isCustomAlpha and req.coefficients:
-        # Reconstruct the linear regression vector in RAM for this specific request
-        signal_series = pd.Series(req.intercept, index=df.index)
-        for feature, coef in req.coefficients.items():
-            if feature in df.columns:
-                signal_series += pd.to_numeric(df[feature], errors='coerce').fillna(0) * coef
-    else:
-        # Standard hardcoded feature
-        if req.alphaId not in df.columns:
-            return {
-                "error": f"Metric key '{req.alphaId}' not found. If custom, ensure coefficients are passed.",
-                "buckets": [], "filteredRows": 0, "totalRows": total_rows
-            }
-        signal_series = pd.to_numeric(df[req.alphaId], errors='coerce').fillna(0)
-
-    # Compute quantile boundary cuts using the dynamic signal_series
+    # ── 4. BUCKETING LOGIC ──
+    # We no longer need the complex router here, because df[req.alphaId] is guaranteed to exist!
+    signal_series = pd.to_numeric(df[req.alphaId], errors='coerce').fillna(0)
     sorted_cuts = sorted(req.thresholds)
     df['bucket_idx'] = np.searchsorted(sorted_cuts, signal_series)
     
     bucket_stats = []
     num_expected_buckets = len(sorted_cuts) + 1
 
-    # Process return metrics across available data columns (scaled to bps by multiplying by 100)
     for b_id in range(num_expected_buckets):
         b_df = df[df['bucket_idx'] == b_id]
         count = len(b_df)
