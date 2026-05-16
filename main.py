@@ -213,6 +213,9 @@ def run_alpha_regression(req: RegressionRequest):
         #         datasets[split_key][sanitized_name] = model.predict(X_slice)
 
         df_oos_eval = datasets["oos"].copy()
+        X_eval = df_oos_eval[valid_features].fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
+        df_oos_eval[sanitized_name] = model.predict(X_eval)
+
         df_oos_eval['bucket_idx'] = pd.qcut(df_oos_eval[sanitized_name], q=10, labels=False, duplicates='drop')
         
         oos_total_rows = len(df_oos_eval)
